@@ -1,0 +1,12 @@
+# requirements.txt
+dash
+dash-bootstrap-components
+pandas
+plotly
+openpyxl
+chromadb
+llama-index
+llama-index-llms-groq
+llama-index-embeddings-huggingface
+python-dotenv
+gunicorn
