@@ -1,4 +1,3 @@
-#backup 2 dash wth black and white apple UI
 import dash
 from dash import dcc
 from dash import html
@@ -7,25 +6,16 @@ import dash_bootstrap_components as dbc
 
 import pandas as pd
 import os
-import chromadb
 import plotly.express as px
-import plotly.graph_objects as go
-from functools import lru_cache
+import requests
+import json
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
-
-# --- LlamaIndex Imports (FINAL STABLE VERSION) ---
-from llama_index.core import VectorStoreIndex, Document, StorageContext, Settings, load_index_from_storage
-from llama_index.vector_stores.chroma import ChromaVectorStore 
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.llms.groq import Groq 
-from llama_index.core.tools import FunctionTool, QueryEngineTool
 # ----------------------------------------------------
 # 1. Configuration and Data Loading
 # ----------------------------------------------------
-PERSIST_DIR = "./invoice_index_storage"
 CSV_FILE_PATH = 'invoice_data.csv'
 THEME = dbc.themes.BOOTSTRAP  # Using Bootstrap as base for custom styling
 
@@ -51,6 +41,36 @@ else:
     print(f"DEBUG: Status values in CSV: {df_invoices['Status'].unique().tolist()}")
     print(f"DEBUG: Status counts: {df_invoices['Status'].value_counts().to_dict()}")
     print(f"{'='*60}\n")
+
+
+# --- Groq API Function (Lightweight) ---
+def query_groq(prompt):
+    """Send query to Groq API directly."""
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+    
+    if not GROQ_API_KEY:
+        return "Error: GROQ_API_KEY not set in environment variables."
+    
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
+            }
+        )
+        
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
+        else:
+            return f"Error: Groq API returned status {response.status_code}"
+    except Exception as e:
+        return f"Error calling Groq API: {str(e)}"
 
 
 # --- Data Visualization Function (The Tool Python Function) ---
@@ -91,301 +111,112 @@ def generate_bar_chart(df: pd.DataFrame, amount_column: str = 'Total_Amount'):
 
 # --- RAG Initialization Functions (Cached and Isolated) ---
 
-# FIX: Function to cache the Chroma client (uses lru_cache)
-@lru_cache(maxsize=1)
-def get_chroma_client():
-    """Initializes and returns the ChromaDB client."""
-    print("--- Initializing ChromaDB Client ---")
-    return chromadb.Client()
-
-# FIXED: Removed @lru_cache decorator because DataFrames are not hashable
-def setup_rag(df):
-    """Sets up the standard RAG system and returns the query engine."""
-    print("--- Starting RAG Setup ---")
-    chroma_client = get_chroma_client()
-
-    # 1. Define the LLM (Groq)
-    # TEMPORARY: Hardcoded API key for testing (REMOVE BEFORE PRODUCTION!)
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or "PASTE_YOUR_GROQ_API_KEY_HERE"
+# Simplified query handler - no heavy dependencies
+class SimpleQueryEngine:
+    """Lightweight query engine using DataFrame and Groq API directly."""
     
-    if not GROQ_API_KEY or GROQ_API_KEY == "PASTE_YOUR_GROQ_API_KEY_HERE":
-        print("=" * 60)
-        print("ERROR: GROQ_API_KEY environment variable is not set!")
-        print("Please set it using: $env:GROQ_API_KEY = 'your_key_here'")
-        print("=" * 60)
-        raise ValueError("GROQ_API_KEY is required but not set in environment variables")
+    def __init__(self, df):
+        self.df = df
     
-    print(f"✓ API Key found: {GROQ_API_KEY[:8]}...{GROQ_API_KEY[-4:]}")
-    
-    llm = Groq(model="llama-3.1-8b-instant", api_key=GROQ_API_KEY, temperature=0.1) 
-    Settings.llm = llm
-    Settings.embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    
-    # --- ALWAYS REBUILD INDEX FOR DEBUGGING ---
-    print("--- Building FRESH data index...")
-    documents = []
-    for index, row in df.iterrows():
-        # Enhanced document text with more context for better retrieval
-        invoice_text = (
-            f"Invoice ID: {row['Invoice_ID']} "
-            f"Company: {row['Company_Name']} "
-            f"Vendor: {row['Vendor_Name']} "
-            f"Type: {row['Type']} "
-            f"Amount: {row['Total_Amount']} {row['Currency']} "
-            f"Status: {row['Status']} "
-            f"Issue Date: {row['Issue_Date']} "
-            f"Due Date: {row['Due_Date']} "
-            f"Approval Date: {row['Approval_Date']} "
-            f"Payment Date: {row['Payment_Date']} "
-            f"Approval Required By: {row['Approval_Required_By']} "
-            f"Description: {row['Invoice_Description']}"
-        )
-        doc = Document(text=invoice_text, doc_id=str(row['Invoice_ID']))
-        documents.append(doc)
-        print(f"  Added document: {row['Invoice_ID']}")
-
-    print(f"--- Total documents to index: {len(documents)} ---")
-
-    # Use a fresh collection name for testing
-    collection_name = "invoice_collection_v2"
-    try:
-        chroma_client.delete_collection(collection_name)
-        print(f"--- Deleted old collection: {collection_name} ---")
-    except:
-        pass
-    
-    chroma_collection = chroma_client.create_collection(collection_name)
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-    print("--- Creating vector index (this may take a moment)... ---")
-    index = VectorStoreIndex.from_documents(
-        documents, 
-        storage_context=storage_context,
-        show_progress=True
-    )
-    
-    print("--- Index created successfully! ---")
-    
-    # Test the collection
-    collection_count = chroma_collection.count()
-    print(f"--- ChromaDB collection has {collection_count} documents ---")
-
-    # Create query engine with verbose output
-    query_engine = index.as_query_engine(
-        similarity_top_k=3,
-        response_mode="compact",
-        verbose=True
-    )
-    
-    # Test query
-    print("\n--- Testing query engine with sample query... ---")
-    test_response = query_engine.query("What is invoice INV-1003-AP?")
-    print(f"Test response: {test_response.response}")
-    print("--- Test complete ---\n")
-    
-    return query_engine
-
-# --- Tool Integration ---
-
-# Wrapper function for the LLM to call the chart tool
-def tool_generate_bar_chart(amount_column: str = 'Total_Amount') -> str:
-    """
-    Generates and saves a Plotly bar chart from invoice data, grouped by month. 
-    It focuses on visualizing a specific 'amount_column' (defaulting to Total_Amount).
-    The actual chart rendering is handled by the Dash callback.
-    """
-    # NOTE: The LLM calls this function. We return a unique string 
-    # that the Dash callback can use to know a chart should be displayed.
-    return f"CHART_TRIGGERED:generate_bar_chart:column={amount_column}"
-
-# 2. Initialize the tool for LlamaIndex/Groq
-CHART_TOOL = FunctionTool.from_defaults(fn=tool_generate_bar_chart, name="generate_chart")
-
-# 3. Create a simple wrapper that handles both query engine and tools
-def setup_rag_with_tools(query_engine, tools):
-    """Wraps the RAG engine with chart tool capability."""
-    # We'll handle tool routing in the callback instead
-    # Return both the query engine and tools as a simple wrapper
-    class SimpleRAGWrapper:
-        def __init__(self, query_engine, tools):
-            self.query_engine = query_engine
-            self.tools = tools
-            self.llm = Settings.llm
+    def query(self, query_str):
+        """Process query using DataFrame lookups and Groq API."""
+        query_lower = query_str.lower()
         
-        def query(self, query_str):
-            # Simple logic: check if user is asking for a chart/visualization
-            chart_keywords = ['chart', 'plot', 'graph', 'visualize', 'visualization', 'show me', 'display']
+        # Check for chart requests
+        chart_keywords = ['chart', 'plot', 'graph', 'visualize', 'visualization', 'show me', 'display']
+        if any(keyword in query_lower for keyword in chart_keywords):
+            return type('Response', (), {
+                'response': 'CHART_TRIGGERED:generate_bar_chart:column=Total_Amount'
+            })()
+        
+        # Check for specific invoice ID
+        import re
+        invoice_match = re.search(r'INV-\d{4}-[A-Z]{2}', query_str, re.IGNORECASE)
+        
+        if invoice_match:
+            invoice_id = invoice_match.group(0).upper()
+            print(f"DEBUG: Looking up invoice: {invoice_id}")
             
-            if any(keyword in query_str.lower() for keyword in chart_keywords):
-                # Return a special response to trigger chart generation
-                return type('Response', (), {
-                    'response': 'CHART_TRIGGERED:generate_bar_chart:column=Total_Amount'
-                })()
+            invoice_data = self.df[self.df['Invoice_ID'] == invoice_id]
             
-            # Check for aggregate/list queries that need full DataFrame scan
-            aggregate_keywords = [
-                'all', 'list', 'show', 'how many', 'total', 'count',
-                'overdue', 'pending', 'need action', 'in progress',
-                'paid', 'closed', 'approved'
-            ]
-            
-            query_lower = query_str.lower()
-            is_aggregate_query = any(keyword in query_lower for keyword in aggregate_keywords)
-            
-            # HYBRID APPROACH 1: Handle specific invoice ID queries
-            import re
-            invoice_match = re.search(r'INV-\d{4}-[A-Z]{2}', query_str, re.IGNORECASE)
-            
-            if invoice_match and not is_aggregate_query:
-                invoice_id = invoice_match.group(0).upper()
-                print(f"DEBUG: Detected specific invoice query: {invoice_id}")
+            if not invoice_data.empty:
+                row = invoice_data.iloc[0]
                 
-                # Try exact DataFrame lookup first
-                from __main__ import df_invoices
-                invoice_data = df_invoices[df_invoices['Invoice_ID'] == invoice_id]
-                
-                if not invoice_data.empty:
-                    row = invoice_data.iloc[0]
-                    print(f"DEBUG: Found exact match in DataFrame for {invoice_id}")
-                    
-                    # Create a contextualized query for LLM
-                    context = (
-                        f"Based on the invoice data:\n"
-                        f"Invoice ID: {row['Invoice_ID']}\n"
-                        f"Company: {row['Company_Name']}\n"
-                        f"Vendor: {row['Vendor_Name']}\n"
-                        f"Type: {row['Type']}\n"
-                        f"Amount: {row['Total_Amount']} {row['Currency']}\n"
-                        f"Status: {row['Status']}\n"
-                        f"Issue Date: {row['Issue_Date']}\n"
-                        f"Due Date: {row['Due_Date']}\n"
-                        f"Approval Date: {row['Approval_Date']}\n"
-                        f"Payment Date: {row['Payment_Date']}\n"
-                        f"Approval Required By: {row['Approval_Required_By']}\n"
-                        f"Description: {row['Invoice_Description']}\n\n"
-                        f"User question: {query_str}\n\n"
-                        f"Provide a natural, conversational answer."
+                # Build response based on query type
+                if 'status' in query_lower:
+                    response_text = (
+                        f"Invoice {invoice_id} has a status of **{row['Status']}**.\n\n"
+                        f"Details:\n"
+                        f"• Company: {row['Company_Name']}\n"
+                        f"• Vendor: {row['Vendor_Name']}\n"
+                        f"• Amount: {row['Total_Amount']} {row['Currency']}\n"
+                        f"• Due Date: {row['Due_Date']}"
                     )
-                    
-                    custom_response = self.llm.complete(context)
-                    return type('Response', (), {
-                        'response': str(custom_response),
-                        'source_nodes': []
-                    })()
+                elif 'amount' in query_lower or 'cost' in query_lower:
+                    response_text = (
+                        f"Invoice {invoice_id} is for **{row['Total_Amount']} {row['Currency']}**.\n\n"
+                        f"• Company: {row['Company_Name']}\n"
+                        f"• Status: {row['Status']}\n"
+                        f"• Due Date: {row['Due_Date']}"
+                    )
+                else:
+                    response_text = (
+                        f"Invoice {invoice_id} Information:\n\n"
+                        f"• Status: {row['Status']}\n"
+                        f"• Company: {row['Company_Name']}\n"
+                        f"• Vendor: {row['Vendor_Name']}\n"
+                        f"• Amount: {row['Total_Amount']} {row['Currency']}\n"
+                        f"• Due Date: {row['Due_Date']}\n"
+                        f"• Type: {row['Type']}"
+                    )
+                
+                return type('Response', (), {'response': response_text})()
+            else:
+                return type('Response', (), {
+                    'response': f"Invoice {invoice_id} not found in the system."
+                })()
+        
+        # Handle aggregate queries
+        aggregate_keywords = ['all', 'list', 'show', 'how many', 'overdue', 'pending', 'action']
+        if any(keyword in query_lower for keyword in aggregate_keywords):
             
-            # HYBRID APPROACH 2: Handle aggregate/list queries with DataFrame
-            if is_aggregate_query:
-                print(f"DEBUG: Detected aggregate query, using DataFrame analysis")
-                from __main__ import df_invoices
-                
-                # Analyze the DataFrame based on query intent
-                result_text = ""
-                
-                if 'overdue' in query_lower:
-                    overdue = df_invoices[df_invoices['Status'] == 'Overdue']
-                    if not overdue.empty:
-                        result_text = f"There are {len(overdue)} overdue invoices:\n\n"
-                        for _, row in overdue.iterrows():
-                            result_text += (
-                                f"• {row['Invoice_ID']} - {row['Company_Name']} - "
-                                f"{row['Total_Amount']} {row['Currency']} - Due: {row['Due_Date']}\n"
-                            )
-                    else:
-                        result_text = "No overdue invoices found."
-                
-                elif 'pending' in query_lower or 'need action' in query_lower or 'in progress' in query_lower or 'action' in query_lower:
-                    # Get all unique status values to ensure we're matching correctly
-                    print(f"DEBUG: All statuses in DataFrame: {df_invoices['Status'].unique().tolist()}")
-                    
-                    action_needed = df_invoices[df_invoices['Status'].isin(['Pending Approval', 'In Progress', 'Overdue'])]
-                    
-                    print(f"DEBUG: Found {len(action_needed)} invoices needing action")
-                    print(f"DEBUG: Status breakdown: {action_needed['Status'].value_counts().to_dict()}")
-                    
-                    if not action_needed.empty:
-                        result_text = f"There are {len(action_needed)} invoices needing action:\n\n"
-                        
-                        # Group by status for better readability
-                        for status in ['Overdue', 'Pending Approval', 'In Progress']:
-                            status_invoices = action_needed[action_needed['Status'] == status]
-                            if not status_invoices.empty:
-                                result_text += f"\n**{status} ({len(status_invoices)}):**\n"
-                                for _, row in status_invoices.iterrows():
-                                    result_text += (
-                                        f"• {row['Invoice_ID']} - {row['Company_Name']} - "
-                                        f"{row['Total_Amount']} {row['Currency']} - Due: {row['Due_Date']}\n"
-                                    )
-                    else:
-                        result_text = "No invoices need action."
-                
-                elif 'paid' in query_lower or 'closed' in query_lower:
-                    paid = df_invoices[df_invoices['Status'] == 'Paid/Closed']
-                    if not paid.empty:
-                        result_text = f"There are {len(paid)} paid/closed invoices:\n\n"
-                        for _, row in paid.head(10).iterrows():  # Limit to first 10
-                            result_text += (
-                                f"• {row['Invoice_ID']} - {row['Company_Name']} - "
-                                f"{row['Total_Amount']} {row['Currency']}\n"
-                            )
-                        if len(paid) > 10:
-                            result_text += f"\n... and {len(paid) - 10} more."
-                    else:
-                        result_text = "No paid/closed invoices found."
-                
-                elif 'how many' in query_lower or 'count' in query_lower or 'total' in query_lower:
-                    total = len(df_invoices)
-                    by_status = df_invoices['Status'].value_counts().to_dict()
-                    result_text = f"Total invoices: {total}\n\nBreakdown by status:\n"
-                    for status, count in by_status.items():
-                        result_text += f"• {status}: {count}\n"
-                
-                if result_text:
-                    return type('Response', (), {
-                        'response': result_text,
-                        'source_nodes': []
-                    })()
+            if 'overdue' in query_lower:
+                overdue = self.df[self.df['Status'] == 'Overdue']
+                if not overdue.empty:
+                    result = f"There are {len(overdue)} overdue invoices:\n\n"
+                    for _, row in overdue.iterrows():
+                        result += f"• {row['Invoice_ID']} - {row['Company_Name']} - {row['Total_Amount']} {row['Currency']}\n"
+                    return type('Response', (), {'response': result})()
             
-            # HYBRID APPROACH 3: Use regular RAG for other queries
-            print("DEBUG: Using regular RAG query")
-            response = self.query_engine.query(query_str)
-            
-            # If RAG response is weak, try DataFrame search
-            if not response.response or str(response.response).strip() in ["", "Unknown.", "None"]:
-                print("DEBUG: RAG returned weak response, trying DataFrame fallback...")
-                if invoice_match:
-                    invoice_id = invoice_match.group(0).upper()
-                    from __main__ import df_invoices
-                    invoice_data = df_invoices[df_invoices['Invoice_ID'] == invoice_id]
-                    if not invoice_data.empty:
-                        row = invoice_data.iloc[0]
-                        fallback_response = (
-                            f"Invoice {invoice_id} Details:\n"
-                            f"• Company: {row['Company_Name']}\n"
-                            f"• Vendor: {row['Vendor_Name']}\n"
-                            f"• Amount: {row['Total_Amount']} {row['Currency']}\n"
-                            f"• Status: {row['Status']}\n"
-                            f"• Due Date: {row['Due_Date']}\n"
-                            f"• Type: {row['Type']}"
-                        )
-                        return type('Response', (), {'response': fallback_response})()
-            
-            return response
-    
-    return SimpleRAGWrapper(query_engine, tools)
+            elif 'pending' in query_lower or 'action' in query_lower:
+                action_needed = self.df[self.df['Status'].isin(['Pending Approval', 'In Progress', 'Overdue'])]
+                if not action_needed.empty:
+                    result = f"There are {len(action_needed)} invoices needing action:\n\n"
+                    for _, row in action_needed.iterrows():
+                        result += f"• {row['Invoice_ID']} - {row['Status']} - {row['Total_Amount']} {row['Currency']}\n"
+                    return type('Response', (), {'response': result})()
+        
+        # For general questions, use Groq API with DataFrame context
+        context = f"Based on this invoice data summary: {len(self.df)} total invoices. "
+        context += f"Status breakdown: {self.df['Status'].value_counts().to_dict()}. "
+        context += f"\n\nUser question: {query_str}"
+        
+        groq_response = query_groq(context)
+        return type('Response', (), {'response': groq_response})()
 
-# --- Initialize RAG once globally ---
-STANDARD_RAG_ENGINE = setup_rag(df_invoices)
-QUERY_ENGINE = setup_rag_with_tools(
-    STANDARD_RAG_ENGINE, 
-    tools=[CHART_TOOL]
-)
+
+# Initialize the query engine
+print("--- Initializing Lightweight Query Engine ---")
+QUERY_ENGINE = SimpleQueryEngine(df_invoices)
+print("✓ Query engine ready!")
+
 
 # ----------------------------------------------------
 # 2. Application Layout (The Professional UI)
 # ----------------------------------------------------
 
 app = dash.Dash(__name__, external_stylesheets=[THEME])
+server = app.server  # Expose server for gunicorn deployment
 
 # Custom CSS for Pure Black & White Minimal Design
 app.index_string = '''
@@ -917,5 +748,8 @@ def run_query(n_clicks, n_submit, user_query):
 
 if __name__ == '__main__':
     # NOTE: Ensure your GROQ_API_KEY is set as an environment variable
-    # Run the application: http://127.0.0.1:8050/
-    app.run(debug=True)
+    # For local: app.run(debug=True)
+    # For production: gunicorn will handle the server
+    import os
+    port = int(os.environ.get('PORT', 8050))
+    app.run(debug=False, host='0.0.0.0', port=port)
